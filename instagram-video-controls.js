@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Instagram Video Controls - Fixed Version
+// @name         Instagram Video Controls
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  Add better video controls to Instagram videos
