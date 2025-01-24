@@ -10,6 +10,20 @@
 (function() {
     'use strict';
 
+    // Prevent automatic video muting
+    const createElementOriginal = document.createElement;
+    document.createElement = function(tag) {
+        const element = createElementOriginal.call(document, tag);
+        if (tag.toLowerCase() === 'video') {
+            Object.defineProperty(element, 'muted', {
+                configurable: false,
+                get: function() { return false; },
+                set: function(value) { return false; }
+            });
+        }
+        return element;
+    }
+
     // Enhanced State management with global event handling
     const VideoState = {
         preferences: {
