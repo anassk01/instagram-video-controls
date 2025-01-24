@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instagram Video Controls - Enhanced State Management
 // @namespace    http://tampermonkey.net/
-// @version      2.4
+// @version      2.5
 // @description  Video controls for Instagram with persistent state across videos
 // @match        https://www.instagram.com/*
 // @grant        none
