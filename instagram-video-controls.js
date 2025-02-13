@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Instagram Video Controls - Enhanced State Management
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Video controls for Instagram with persistent state across videos
+// @version      2.7
+// @description  Video controls for Instagram with persistent state and improved muting prevention
 // @match        https://www.instagram.com/*
 // @grant        none
 // ==/UserScript==
@@ -10,81 +10,97 @@
 (function() {
     'use strict';
 
-    // Prevent automatic video muting
-    const createElementOriginal = document.createElement;
-    document.createElement = function(tag) {
-        const element = createElementOriginal.call(document, tag);
-        if (tag.toLowerCase() === 'video') {
-            Object.defineProperty(element, 'muted', {
-                configurable: false,
-                get: function() { return false; },
-                set: function(value) { return false; }
-            });
-        }
-        return element;
-    }
+    // Immediate execution to handle any pre-existing videos
+    const handleExistingVideos = () => {
+        document.querySelectorAll('video').forEach(video => {
+            video.muted = false;
+            video.removeAttribute('muted');
 
-    // Enhanced State management with global event handling
-    const VideoState = {
-        preferences: {
-            volume: 1,
-            speed: 1,
-            backgroundPlay: false,
-            isMuted: false
-        },
-        activeControlInstances: new Set(),
-
-        initialize() {
-            try {
-                const saved = JSON.parse(localStorage.getItem('igVideoPreferences'));
-                if (saved) {
-                    this.preferences = { ...this.preferences, ...saved };
+            // Override muted property for existing videos
+            Object.defineProperty(video, 'muted', {
+                configurable: true,
+                get: function() {
+                    return this._muted || false;
+                },
+                set: function(value) {
+                    // Only allow unmuting
+                    if (value === false) {
+                        this._muted = false;
+                    }
+                    return false;
                 }
-                window.addEventListener('igVideoStateChange', this.broadcastStateChange.bind(this));
-            } catch (e) {
-                console.error('Error loading preferences:', e);
-            }
-        },
-
-        save() {
-            try {
-                localStorage.setItem('igVideoPreferences', JSON.stringify(this.preferences));
-                window.dispatchEvent(new CustomEvent('igVideoStateChange', {
-                    detail: { ...this.preferences }
-                }));
-            } catch (e) {
-                console.error('Error saving preferences:', e);
-            }
-        },
-
-        update(key, value) {
-            this.preferences[key] = value;
-            this.save();
-        },
-
-        registerInstance(controlInstance) {
-            this.activeControlInstances.add(controlInstance);
-        },
-
-        unregisterInstance(controlInstance) {
-            this.activeControlInstances.delete(controlInstance);
-        },
-
-        broadcastStateChange(event) {
-            const newState = event.detail;
-            this.activeControlInstances.forEach(instance => {
-                instance.applyState(newState);
             });
-        },
 
-        getInitialState(video) {
-            return {
-                volume: video.volume,
-                speed: video.playbackRate,
-                isMuted: video.muted
+            // Prevent muted attribute
+            const originalSetAttribute = video.setAttribute;
+            video.setAttribute = function(name, value) {
+                if (name === 'muted') return;
+                originalSetAttribute.call(this, name, value);
             };
-        }
+        });
     };
+
+    // Run immediately for any existing videos
+    handleExistingVideos();
+
+    // Early muting prevention for new videos
+    const preventMuting = () => {
+        const originalCreateElement = document.createElement;
+        document.createElement = function(tag) {
+            const element = originalCreateElement.call(document, tag);
+            if (tag.toLowerCase() === 'video') {
+                // Immediately set muted to false
+                element.muted = false;
+
+                // Override muted property
+                Object.defineProperty(element, 'muted', {
+                    configurable: true,
+                    get: function() {
+                        return this._muted || false;
+                    },
+                    set: function(value) {
+                        // Only allow unmuting
+                        if (value === false) {
+                            this._muted = false;
+                        }
+                        return false;
+                    }
+                });
+
+                // Prevent muted attribute
+                const originalSetAttribute = element.setAttribute;
+                element.setAttribute = function(name, value) {
+                    if (name === 'muted') return;
+                    originalSetAttribute.call(this, name, value);
+                };
+            }
+            return element;
+        };
+    };
+
+    // Additional observer to catch dynamically added video elements
+    const observeVideoElements = () => {
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                    if (node.nodeName === 'VIDEO') {
+                        node.muted = false;
+                        node.removeAttribute('muted');
+                    }
+                });
+            });
+        });
+
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+    };
+
+    // Initialize muting prevention immediately
+    preventMuting();
+    observeVideoElements();
+
 
     // UI Constants
     const UI = {
@@ -123,7 +139,245 @@
         }
     };
 
-    // Utility functions for DOM manipulation and event handling
+    // Video State Management
+    const VideoState = {
+        preferences: {
+            volume: 1,
+            speed: 1,
+            backgroundPlay: false,
+            isMuted: false,
+            lastUpdate: Date.now()
+        },
+        activeControlInstances: new Set(),
+        saveTimeout: null,
+        lastKnownGoodState: null,
+
+        initialize() {
+            try {
+                // Load saved preferences
+                const saved = localStorage.getItem('igVideoPreferences');
+                if (saved) {
+                    const parsedPrefs = JSON.parse(saved);
+                    // Validate and merge saved preferences
+                    this.preferences = {
+                        volume: this.isValidVolume(parsedPrefs.volume) ? parsedPrefs.volume : this.preferences.volume,
+                        speed: this.isValidSpeed(parsedPrefs.speed) ? parsedPrefs.speed : this.preferences.speed,
+                        backgroundPlay: typeof parsedPrefs.backgroundPlay === 'boolean' ? parsedPrefs.backgroundPlay : this.preferences.backgroundPlay,
+                        isMuted: typeof parsedPrefs.isMuted === 'boolean' ? parsedPrefs.isMuted : this.preferences.isMuted,
+                        lastUpdate: Date.now()
+                    };
+                    this.lastKnownGoodState = { ...this.preferences };
+                }
+
+                // Set up observers
+                this.setupLazyLoadDetection();
+                this.setupIntersectionObserver();
+
+                window.addEventListener('igVideoStateChange', this.broadcastStateChange.bind(this));
+                window.addEventListener('beforeunload', () => {
+                    if (this.saveTimeout) {
+                        clearTimeout(this.saveTimeout);
+                        this.savePreferences();
+                    }
+                });
+
+            } catch (e) {
+                console.error('Error initializing video state:', e);
+                this.savePreferences();
+            }
+        },
+
+        setupLazyLoadDetection() {
+            // Watch for new video elements being added
+            const videoObserver = new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                    if (mutation.type === 'childList') {
+                        mutation.addedNodes.forEach(node => {
+                            if (node.nodeName === 'VIDEO') {
+                                // Immediately prevent muting for new videos
+                                this.preventMutingForVideo(node);
+
+                                // Force state application after a short delay
+                                setTimeout(() => {
+                                    this.enforceStateOnVideo(node);
+                                }, 50); // Small delay to ensure video is initialized
+                            } else if (node.querySelectorAll) {
+                                // Check for videos in added containers
+                                node.querySelectorAll('video').forEach(video => {
+                                    this.preventMutingForVideo(video);
+                                    setTimeout(() => {
+                                        this.enforceStateOnVideo(video);
+                                    }, 50);
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+
+            videoObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['src', 'style']
+            });
+        },
+
+        setupIntersectionObserver() {
+            // Watch for videos coming into view
+            const intersectionObserver = new IntersectionObserver((entries) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting && entry.target.nodeName === 'VIDEO') {
+                        // When a video comes into view, ensure state is correct
+                        this.enforceStateOnVideo(entry.target);
+                    }
+                });
+            }, {
+                rootMargin: '50px 0px', // Start checking slightly before video comes into view
+                threshold: 0.1
+            });
+
+            // Observe all existing videos
+            document.querySelectorAll('video').forEach(video => {
+                intersectionObserver.observe(video);
+            });
+
+            // Watch for new videos to observe
+            const videoObserver = new MutationObserver((mutations) => {
+                mutations.forEach(mutation => {
+                    mutation.addedNodes.forEach(node => {
+                        if (node.nodeName === 'VIDEO') {
+                            intersectionObserver.observe(node);
+                        } else if (node.querySelectorAll) {
+                            node.querySelectorAll('video').forEach(video => {
+                                intersectionObserver.observe(video);
+                            });
+                        }
+                    });
+                });
+            });
+
+            videoObserver.observe(document.body, {
+                childList: true,
+                subtree: true
+            });
+        },
+
+        preventMutingForVideo(video) {
+            // Immediate unmuting
+            video.muted = false;
+            video.removeAttribute('muted');
+
+            // Override muted property
+            Object.defineProperty(video, 'muted', {
+                configurable: true,
+                get: function() {
+                    return this._muted || false;
+                },
+                set: function(value) {
+                    // Only allow unmuting
+                    if (value === false) {
+                        this._muted = false;
+                    }
+                    return false;
+                }
+            });
+
+            // Prevent muted attribute
+            const originalSetAttribute = video.setAttribute;
+            video.setAttribute = function(name, value) {
+                if (name === 'muted') return;
+                originalSetAttribute.call(this, name, value);
+            };
+        },
+
+        enforceStateOnVideo(video) {
+            if (!video || !this.lastKnownGoodState) return;
+
+            // Find the control instance for this video
+            let controlInstance = null;
+            this.activeControlInstances.forEach(instance => {
+                if (instance.video === video) {
+                    controlInstance = instance;
+                }
+            });
+
+            if (controlInstance) {
+                controlInstance.forceApplyState(this.lastKnownGoodState);
+            } else {
+                // If no control instance exists yet, apply state directly
+                video.muted = this.lastKnownGoodState.isMuted;
+                video.volume = this.lastKnownGoodState.volume;
+                video.playbackRate = this.lastKnownGoodState.speed;
+            }
+        },
+
+        isValidVolume(vol) {
+            return typeof vol === 'number' && vol >= 0 && vol <= 1;
+        },
+
+        isValidSpeed(speed) {
+            const validSpeeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+            return validSpeeds.includes(speed);
+        },
+
+        savePreferences() {
+            try {
+                // Update lastUpdate timestamp
+                this.preferences.lastUpdate = Date.now();
+                localStorage.setItem('igVideoPreferences', JSON.stringify(this.preferences));
+                // Update last known good state
+                this.lastKnownGoodState = { ...this.preferences };
+            } catch (e) {
+                console.error('Error saving preferences:', e);
+            }
+        },
+
+        update(key, value) {
+            if (this.saveTimeout) {
+                clearTimeout(this.saveTimeout);
+            }
+
+            let isValid = true;
+            if (key === 'volume') {
+                isValid = this.isValidVolume(value);
+            } else if (key === 'speed') {
+                isValid = this.isValidSpeed(value);
+            }
+
+            if (isValid) {
+                this.preferences[key] = value;
+                this.preferences.lastUpdate = Date.now();
+                this.lastKnownGoodState = { ...this.preferences };
+
+                this.saveTimeout = setTimeout(() => {
+                    this.savePreferences();
+                    window.dispatchEvent(new CustomEvent('igVideoStateChange', {
+                        detail: { ...this.preferences }
+                    }));
+                }, 300);
+            }
+        },
+
+        registerInstance(controlInstance) {
+            this.activeControlInstances.add(controlInstance);
+            controlInstance.applyState(this.preferences);
+        },
+
+        unregisterInstance(controlInstance) {
+            this.activeControlInstances.delete(controlInstance);
+        },
+
+        broadcastStateChange(event) {
+            const newState = event.detail;
+            this.activeControlInstances.forEach(instance => {
+                instance.applyState(newState);
+            });
+        }
+    };
+
+
+    // DOM Utilities
     const DOMUtils = {
         createButton(options = {}) {
             const button = document.createElement('button');
@@ -176,6 +430,7 @@
         }
     };
 
+    // Video Controls Class
     class VideoControls {
         constructor(videoElement) {
             this.video = videoElement;
@@ -183,16 +438,6 @@
             this.eventListeners = new Set();
 
             VideoState.registerInstance(this);
-            const initialState = VideoState.getInitialState(this.video);
-
-            if (initialState.isMuted !== VideoState.preferences.isMuted) {
-                VideoState.update('isMuted', initialState.isMuted);
-            }
-            if (initialState.volume !== VideoState.preferences.volume && initialState.volume !== 0) {
-                VideoState.update('volume', initialState.volume);
-            }
-
-            this.applyState(VideoState.preferences);
             this.container = this.createControlsContainer();
             this.initializeVideoState();
         }
@@ -226,7 +471,9 @@
 
             if (options.menu) {
                 control.appendChild(options.menu);
-                DOMUtils.setupHoverMenu(control, options.menu);
+                if (options.useHoverMenu) {
+                    DOMUtils.setupHoverMenu(control, options.menu);
+                }
             }
 
             return { control, button };
@@ -337,7 +584,6 @@
         createSpeedControl() {
             const options = this.createSpeedOptions();
             options.style.display = 'none';
-            options.dataset.displayType = 'flex';
 
             return this.createControlComponent({
                 className: 'ig-video-speed-control',
@@ -347,7 +593,26 @@
                     padding: '4px 8px'
                 },
                 buttonContent: `${this.video.playbackRate}x`,
-                menu: options
+                menu: options,
+                useHoverMenu: false,
+                onClick: (e) => {
+                    e.stopPropagation();
+                    const menu = options;
+                    const isVisible = menu.style.display === 'flex';
+                    menu.style.display = isVisible ? 'none' : 'flex';
+
+                    if (!isVisible) {
+                        const closeMenu = (event) => {
+                            if (!menu.contains(event.target)) {
+                                menu.style.display = 'none';
+                                document.removeEventListener('click', closeMenu);
+                            }
+                        };
+                        setTimeout(() => {
+                            document.addEventListener('click', closeMenu);
+                        }, 0);
+                    }
+                }
             }).control;
         }
 
@@ -356,14 +621,15 @@
             container.className = 'ig-video-speed-options';
             Object.assign(container.style, {
                 position: 'absolute',
-                top: '100%',
+                top: 'calc(100% + 5px)',
                 left: '50%',
                 transform: 'translateX(-50%)',
                 background: UI.colors.background,
                 borderRadius: '4px',
+                display: 'none',
                 flexDirection: 'column',
-                marginTop: '8px',
                 minWidth: '80px',
+                boxShadow: '0 2px 8px rgba(0,0,0,0.2)',
                 zIndex: '10000001'
             });
 
@@ -374,7 +640,11 @@
                         padding: '8px 16px',
                         fontSize: UI.sizes.fontSize.normal,
                         width: '100%',
-                        textAlign: 'center'
+                        textAlign: 'center',
+                        background: 'none',
+                        border: 'none',
+                        color: '#ffffff',
+                        cursor: 'pointer'
                     },
                     innerHTML: `${speed}x`,
                     onclick: (e) => {
@@ -394,8 +664,7 @@
         createVolumeControl() {
             const sliderContainer = document.createElement('div');
             sliderContainer.className = 'ig-video-volume-slider-container';
-            Object.assign(sliderContainer.style, {
-                position: 'absolute',
+            Object.assign(sliderContainer.style, {position: 'absolute',
                 left: '25px',
                 top: '50%',
                 transform: 'translateY(-50%)',
@@ -423,7 +692,8 @@
                     VideoState.update('isMuted', this.video.muted);
                     this.updateVolumeUI();
                 },
-                menu: sliderContainer
+                menu: sliderContainer,
+                useHoverMenu: true
             });
 
             return control;
@@ -454,9 +724,6 @@
 
             return slider;
         }
-
-
-        // ... continuing VideoControls class
 
         createBackgroundPlayControl() {
             const updateBgPlayButton = (button) => {
@@ -489,13 +756,6 @@
         }
 
         createTimeline() {
-            const { timeline, progress, seekHandle, tooltip } = this.createTimelineElements();
-            const container = this.setupTimelineContainer(timeline, progress, seekHandle, tooltip);
-            this.setupTimelineEvents(container, timeline, progress, seekHandle, tooltip);
-            return container;
-        }
-
-        createTimelineElements() {
             const timeline = document.createElement('div');
             timeline.className = 'ig-video-timeline';
             Object.assign(timeline.style, {
@@ -550,10 +810,8 @@
             });
 
             progress.appendChild(seekHandle);
-            return { timeline, progress, seekHandle, tooltip };
-        }
+            timeline.appendChild(progress);
 
-        setupTimelineContainer(timeline, progress, seekHandle, tooltip) {
             const container = DOMUtils.createContainer({
                 className: 'ig-video-timeline-container',
                 style: {
@@ -566,9 +824,10 @@
                 }
             });
 
-            timeline.appendChild(progress);
             container.appendChild(timeline);
             container.appendChild(tooltip);
+
+            this.setupTimelineEvents(container, timeline, progress, seekHandle, tooltip);
 
             return container;
         }
@@ -587,12 +846,6 @@
                 this.video.currentTime = newTime;
             };
 
-            this.setupTimelineDragEvents(container, timeline, seekHandle, updateTimelinePosition);
-            this.setupTimelineHoverEvents(container, timeline, seekHandle, tooltip);
-            this.setupTimelineProgressUpdate(progress);
-        }
-
-        setupTimelineDragEvents(container, timeline, seekHandle, updateTimelinePosition) {
             this.addEventListener(container, 'mousedown', (e) => {
                 e.stopPropagation();
                 this.isDragging = true;
@@ -612,9 +865,7 @@
                 document.addEventListener('mousemove', handleMouseMove);
                 document.addEventListener('mouseup', handleMouseUp);
             });
-        }
 
-        setupTimelineHoverEvents(container, timeline, seekHandle, tooltip) {
             this.addEventListener(container, 'mousemove', (e) => {
                 const rect = timeline.getBoundingClientRect();
                 const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
@@ -641,9 +892,7 @@
                     seekHandle.style.transform = 'translateY(-50%) scale(1)';
                 }
             });
-        }
 
-        setupTimelineProgressUpdate(progress) {
             this.addEventListener(this.video, 'timeupdate', () => {
                 if (!this.isDragging) {
                     const progressValue = (this.video.currentTime / this.video.duration) * 100;
@@ -653,8 +902,18 @@
         }
 
         initializeVideoState() {
-            this.setupVideoListeners();
-            this.applyState(VideoState.preferences);
+            if (this.video) {
+                // Force unmute and set initial volume
+                this.video.muted = false;
+                this.video.removeAttribute('muted');
+
+                if (this.video.volume === 0) {
+                    this.video.volume = VideoState.preferences.volume;
+                }
+
+                this.setupVideoListeners();
+                this.applyState(VideoState.preferences);
+            }
         }
 
         setupVideoListeners() {
@@ -692,6 +951,34 @@
                 state.backgroundPlay ? this.enableBackgroundPlay() : this.disableBackgroundPlay();
             }
         }
+
+            forceApplyState(state) {
+        if (this.video) {
+            // Force apply state regardless of current values
+            this.video.muted = state.isMuted;
+            this.video.volume = state.volume;
+            this.video.playbackRate = state.speed;
+
+            // Force update UI elements
+            if (this.container) {
+                const volumeButton = this.container.querySelector('.ig-video-volume-button');
+                const volumeSlider = this.container.querySelector('.ig-video-slider');
+                const speedButton = this.container.querySelector('.ig-video-speed-button');
+                const bgPlayButton = this.container.querySelector('.ig-video-bgplay-control .ig-video-control-button');
+
+                if (volumeButton) volumeButton.innerHTML = state.isMuted ? '🔇' : '🔊';
+                if (volumeSlider) volumeSlider.value = state.isMuted ? 0 : state.volume * 100;
+                if (speedButton) speedButton.innerHTML = `${state.speed}x`;
+                if (bgPlayButton) {
+                    bgPlayButton.innerHTML = state.backgroundPlay ? '🔓' : '🔒';
+                    bgPlayButton.style.opacity = state.backgroundPlay ? '1' : '0.7';
+                }
+            }
+
+            // Enforce background play state
+            state.backgroundPlay ? this.enableBackgroundPlay() : this.disableBackgroundPlay();
+        }
+    }
 
         updateVolumeUI() {
             const button = this.container.querySelector('.ig-video-volume-button');
@@ -773,7 +1060,10 @@
         document.head.appendChild(styleSheet);
     };
 
-    // Initialize video controls with enhanced observer
+
+
+
+    // Initialize video controls
     const initVideoControls = () => {
         const processedVideos = new WeakSet();
 
@@ -782,6 +1072,10 @@
 
             const videoContainer = videoElement.closest('div[class*="x5yr21d"][class*="x1uhb9sk"]');
             if (!videoContainer) return;
+
+            // Early unmuting
+            videoElement.muted = false;
+            videoElement.removeAttribute('muted');
 
             processedVideos.add(videoElement);
             const controls = new VideoControls(videoElement);
@@ -794,6 +1088,8 @@
                     zIndex: '9999999'
                 }
             });
+
+
 
             controlsWrapper.appendChild(controls.container);
             videoContainer.parentElement.insertBefore(controlsWrapper, videoContainer);
@@ -813,6 +1109,7 @@
             });
         };
 
+        // Main observer
         const observer = new MutationObserver((mutations) => {
             mutations.forEach(mutation => {
                 mutation.addedNodes.forEach(node => {
@@ -822,7 +1119,7 @@
                         node.querySelectorAll('video').forEach(addControlsToVideo);
                     }
                 });
-            });
+                });
         });
 
         observer.observe(document.body, {
@@ -832,19 +1129,23 @@
             attributeFilter: ['src', 'style', 'class']
         });
 
+        // Process existing videos
         document.querySelectorAll('video').forEach(addControlsToVideo);
+
+
+
     };
 
     // Initialize everything
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            VideoState.initialize();
-            addStyles();
-            initVideoControls();
-        });
-    } else {
+    const initialize = () => {
         VideoState.initialize();
         addStyles();
         initVideoControls();
+    };
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initialize);
+    } else {
+        initialize();
     }
 })();
