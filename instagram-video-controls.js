@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Instagram Video Controls - Enhanced State Management
 // @namespace    http://tampermonkey.net/
-// @version      4.0.0
+// @version      4.0.1
 // @description  Accessible video controls for Instagram: seeking, volume, speed and optional background playback.
 // @match        https://www.instagram.com/*
 // @license      MIT
@@ -16,10 +16,10 @@
 
     // Also makes OpenCLI reinjection safe during development.
     window.__IGVideoControls?.destroy();
-    const VERSION = '4.0.0';
+    const VERSION = '4.0.1';
     const KEY = 'igVideoPreferences';
     const speeds = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
-    const defaults = { volume: 1, speed: 1, isMuted: null, backgroundPlay: false };
+    const defaults = { volume: 1, speed: 1, isMuted: false, backgroundPlay: false };
     const instances = new Map();
     const lifetime = new AbortController();
     let preferences = { ...defaults };
@@ -37,7 +37,7 @@
         return {
             volume: Number.isFinite(p.volume) && p.volume >= 0 && p.volume <= 1 ? p.volume : 1,
             speed: speeds.includes(p.speed) ? p.speed : 1,
-            isMuted: typeof p.isMuted === 'boolean' ? p.isMuted : null,
+            isMuted: typeof p.isMuted === 'boolean' ? p.isMuted : false,
             backgroundPlay: typeof p.backgroundPlay === 'boolean' ? p.backgroundPlay : false
         };
     }
@@ -466,6 +466,10 @@
                 if (instance.available && (event.type === 'keydown' || (event.clientX >= r.left && event.clientX <= r.right && event.clientY >= r.top && event.clientY <= r.bottom))) instance.userPaused = false;
             }
         };
+        // Browsers refuse unmuted playback before the first click/key; unmute playing videos as soon as it happens.
+        const unmuteOnActivation = () => setTimeout(() => { for (const i of instances.values()) i.apply(); });
+        listen(document, 'pointerdown', unmuteOnActivation, lifetime.signal, { capture: true, passive: true, once: true });
+        listen(document, 'keydown', unmuteOnActivation, lifetime.signal, { capture: true, passive: true, once: true });
         listen(document, 'pointerdown', releaseNativePause, lifetime.signal, { capture: true, passive: true });
         listen(document, 'keydown', releaseNativePause, lifetime.signal, { capture: true });
         const nativeSoundAction = event => {
